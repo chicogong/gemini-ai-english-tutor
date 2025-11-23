@@ -31,8 +31,12 @@ const App: React.FC = () => {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const sessionRef = useRef<any>(null); // To hold the live session
+  const sessionRef = useRef<any>(null); 
   const transcriptContainerRef = useRef<HTMLDivElement>(null);
+
+  // Transcription accumulation
+  const currentInputTranscriptionRef = useRef('');
+  const currentOutputTranscriptionRef = useRef('');
 
   // Scroll to bottom of transcript
   useEffect(() => {
@@ -42,17 +46,11 @@ const App: React.FC = () => {
   }, [messages]);
 
   const disconnect = useCallback(() => {
-    if (sessionRef.current) {
-        // Stop session if method available
-    }
-    
-    // Stop microphone
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
 
-    // Close Audio Contexts
     if (inputAudioContextRef.current) {
       inputAudioContextRef.current.close();
       inputAudioContextRef.current = null;
@@ -62,30 +60,31 @@ const App: React.FC = () => {
       outputAudioContextRef.current = null;
     }
 
-    // Stop all playing audio
     sourcesRef.current.forEach(source => source.stop());
     sourcesRef.current.clear();
 
     setConnectionState(ConnectionState.DISCONNECTED);
     setIsMuted(false);
     nextStartTimeRef.current = 0;
+    currentInputTranscriptionRef.current = '';
+    currentOutputTranscriptionRef.current = '';
   }, []);
 
   const connectToGemini = async () => {
     setConnectionState(ConnectionState.CONNECTING);
     setMessages([]);
+    currentInputTranscriptionRef.current = '';
+    currentOutputTranscriptionRef.current = '';
 
     try {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       
-      // Initialize Audio Contexts
       inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       
       const inputCtx = inputAudioContextRef.current;
       const outputCtx = outputAudioContextRef.current;
 
-      // Resume output context to prevent autoplay blocks
       if (outputCtx.state === 'suspended') {
         await outputCtx.resume();
       }
@@ -93,7 +92,6 @@ const App: React.FC = () => {
       const outputNode = outputCtx.createGain();
       outputNode.connect(outputCtx.destination);
 
-      // Get Microphone Stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -101,8 +99,10 @@ const App: React.FC = () => {
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         config: {
           responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {}, // Enable user transcription
+          outputAudioTranscription: {}, // Enable model transcription
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } }, // Friendly voice
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } },
           },
           systemInstruction: `You are Alex, a professional and energetic English language teacher. 
 Your goal is to conduct an interactive speaking lesson with the user.
@@ -121,7 +121,6 @@ Rules for interaction:
           onopen: async () => {
             setConnectionState(ConnectionState.CONNECTED);
             
-            // Resume Audio Context again to be safe
             if (outputCtx.state === 'suspended') {
                 await outputCtx.resume();
             }
@@ -129,43 +128,35 @@ Rules for interaction:
             // Trigger the model to speak first
             setTimeout(() => {
                 sessionPromise.then(session => {
-                    // 1. Send a text trigger to "wake up" the model.
-                    // Using camelCase 'clientContent' and 'turnComplete' which matches JS SDK conventions.
                     const triggerMsg = {
-                        clientContent: {
+                        client_content: {
                             turns: [{
                                 role: 'user',
                                 parts: [{ text: "Hello teacher, please introduce yourself and start the lesson." }]
                             }],
-                            turnComplete: true
+                            turn_complete: true
                         }
                     };
                     
                     const s = session as any;
-                    // Check if send exists (it usually handles raw websocket messages)
                     if (typeof s.send === 'function') {
                          s.send(triggerMsg);
                     }
 
-                    // 2. Fallback: Send 1 second of silence to simulate a completed user turn
-                    // This helps if the text trigger is ignored or not supported in this version
                     const silence = new Float32Array(16000); 
                     const pcmBlob = createPcmBlob(silence);
-                    // Send a few buffers to ensure connection liveliness
-                    s.sendRealtimeInput({ media: pcmBlob });
+                    session.sendRealtimeInput({ media: pcmBlob });
                 });
-            }, 100);
+            }, 500);
 
-            // Process Input Audio
             const source = inputCtx.createMediaStreamSource(stream);
             const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
-              if (isMuted) return; // Don't send data if muted
+              if (isMuted) return;
 
               const inputData = e.inputBuffer.getChannelData(0);
               
-              // Simple volume meter logic
               let sum = 0;
               for(let i=0; i<inputData.length; i++) sum += inputData[i] * inputData[i];
               setCurrentVolume(Math.sqrt(sum / inputData.length));
@@ -180,10 +171,47 @@ Rules for interaction:
             scriptProcessor.connect(inputCtx.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
+             const serverContent = message.serverContent;
+
+             // Handle Transcription
+             if (serverContent?.inputTranscription) {
+                 const text = serverContent.inputTranscription.text;
+                 if (text) currentInputTranscriptionRef.current += text;
+             }
+             
+             if (serverContent?.outputTranscription) {
+                 const text = serverContent.outputTranscription.text;
+                 if (text) currentOutputTranscriptionRef.current += text;
+             }
+
+             if (serverContent?.turnComplete) {
+                 const userText = currentInputTranscriptionRef.current.trim();
+                 const modelText = currentOutputTranscriptionRef.current.trim();
+
+                 if (userText) {
+                     setMessages(prev => [...prev, {
+                         id: Date.now().toString() + '-user',
+                         role: 'user',
+                         text: userText,
+                         timestamp: new Date()
+                     }]);
+                     currentInputTranscriptionRef.current = '';
+                 }
+
+                 if (modelText) {
+                     setMessages(prev => [...prev, {
+                         id: Date.now().toString() + '-model',
+                         role: 'model',
+                         text: modelText,
+                         timestamp: new Date()
+                     }]);
+                     currentOutputTranscriptionRef.current = '';
+                 }
+             }
+
              // Handle Audio Output
-             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+             const base64Audio = serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
              if (base64Audio) {
-               // Ensure context is running when we receive audio
                if (outputCtx.state === 'suspended') {
                    await outputCtx.resume();
                }
@@ -206,11 +234,12 @@ Rules for interaction:
                sourcesRef.current.add(source);
              }
 
-             // Handle Interruption
-             if (message.serverContent?.interrupted) {
+             if (serverContent?.interrupted) {
                 sourcesRef.current.forEach(src => src.stop());
                 sourcesRef.current.clear();
                 nextStartTimeRef.current = 0;
+                // Also clear partial transcriptions on interrupt
+                currentOutputTranscriptionRef.current = '';
              }
           },
           onclose: () => {
@@ -262,7 +291,7 @@ Rules for interaction:
       </header>
 
       {/* Main Content Area */}
-      <main className="flex-1 relative flex flex-col max-w-4xl mx-auto w-full p-4">
+      <main className="flex-1 relative flex flex-col max-w-4xl mx-auto w-full p-4 h-full">
           
         {/* Intro Screen */}
         {connectionState === ConnectionState.DISCONNECTED && (
@@ -292,21 +321,24 @@ Rules for interaction:
              </div>
         )}
 
-        {/* Transcript Area - SIMPLIFIED: Only showing Voice Visuals mostly as text is disabled to fix error */}
+        {/* Transcript Area */}
         {connectionState !== ConnectionState.DISCONNECTED && (
             <div 
                 ref={transcriptContainerRef}
-                className="flex-1 flex flex-col items-center justify-center mb-36 px-4"
+                className="flex-1 overflow-y-auto px-4 py-6 space-y-6 mb-36 scrollbar-hide w-full"
             >
-                <div className="text-center space-y-6">
-                    <div className="inline-block p-4 rounded-full bg-indigo-500/10 text-indigo-400 mb-4 animate-pulse">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                {messages.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center h-full opacity-50">
+                        <div className="inline-block p-4 rounded-full bg-indigo-500/10 text-indigo-400 mb-4 animate-pulse">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+                        </div>
+                        <p className="text-slate-400">Waiting for conversation to start...</p>
                     </div>
-                    <h3 className="text-2xl font-bold text-white">Conversation Active</h3>
-                    <p className="text-slate-400 max-w-sm mx-auto">
-                        Speak clearly. Alex is listening and will respond to your answers.
-                    </p>
-                </div>
+                ) : (
+                    messages.map(msg => (
+                        <TranscriptMessage key={msg.id} message={msg} />
+                    ))
+                )}
             </div>
         )}
 
@@ -321,7 +353,7 @@ Rules for interaction:
                     <div className="w-full max-w-sm h-full relative">
                         <Visualizer isActive={connectionState === ConnectionState.CONNECTED && !isMuted && currentVolume > 0.01} color="#818cf8" />
                         <div className="absolute bottom-0 left-0 right-0 text-center text-xs text-slate-500 font-medium uppercase tracking-widest mt-2">
-                             Listening...
+                             {connectionState === ConnectionState.CONNECTED ? "Listening..." : "Connecting..."}
                         </div>
                     </div>
                 </div>
