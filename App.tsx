@@ -85,16 +85,17 @@ const App: React.FC = () => {
       const inputCtx = inputAudioContextRef.current;
       const outputCtx = outputAudioContextRef.current;
 
+      // Resume output context to prevent autoplay blocks
+      if (outputCtx.state === 'suspended') {
+        await outputCtx.resume();
+      }
+
       const outputNode = outputCtx.createGain();
       outputNode.connect(outputCtx.destination);
 
       // Get Microphone Stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
-
-      // Variables for transcription state
-      let currentInputTranscription = '';
-      let currentOutputTranscription = '';
 
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
@@ -103,34 +104,57 @@ const App: React.FC = () => {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Puck' } }, // Friendly voice
           },
-          systemInstruction: `You are Alex, a professional, energetic, and patient English language teacher. 
+          systemInstruction: `You are Alex, a professional and energetic English language teacher. 
 Your goal is to conduct an interactive speaking lesson with the user.
 
+CRITICAL INSTRUCTION:
+You must ALWAYS SPEAK FIRST immediately after the connection is established. 
+Do not wait for the user to say something. 
+Start by introducing yourself enthusiastically and asking the user a simple question (e.g., "Hi! I'm Alex. What is your name?").
+
 Rules for interaction:
-1. START THE CONVERSATION: As soon as the session begins, introduce yourself enthusiastically and ask the user a question (e.g., their name or how they are doing).
-2. PROACTIVE QUESTIONING: You must drive the conversation. After acknowledging the user's answer, ALWAYS ask a follow-up question to encourage them to speak more.
-3. CORRECTION: If the user makes a significant grammar or vocabulary mistake, gently correct them (e.g., "A better way to say that is..."), then immediately move on to the next question.
-4. CONCISENESS: Keep your responses brief (1-3 sentences). Do not lecture.
-5. TONE: Be encouraging and supportive.`,
+1. Always ask a follow-up question after the user answers.
+2. If the user makes a mistake, gently correct them.
+3. Keep your responses concise (1-3 sentences).`,
         },
         callbacks: {
-          onopen: () => {
+          onopen: async () => {
             setConnectionState(ConnectionState.CONNECTED);
             
-            // Trigger the model to speak first using the turn strategy
-            sessionPromise.then(session => {
-                if (typeof (session as any).send === 'function') {
-                    (session as any).send({
+            // Resume Audio Context again to be safe
+            if (outputCtx.state === 'suspended') {
+                await outputCtx.resume();
+            }
+
+            // Trigger the model to speak first
+            setTimeout(() => {
+                sessionPromise.then(session => {
+                    // 1. Send a text trigger to "wake up" the model.
+                    // Using camelCase 'clientContent' and 'turnComplete' which matches JS SDK conventions.
+                    const triggerMsg = {
                         clientContent: {
                             turns: [{
                                 role: 'user',
-                                parts: [{ text: "Hello teacher, I am ready to start the lesson." }]
+                                parts: [{ text: "Hello teacher, please introduce yourself and start the lesson." }]
                             }],
                             turnComplete: true
                         }
-                    });
-                }
-            });
+                    };
+                    
+                    const s = session as any;
+                    // Check if send exists (it usually handles raw websocket messages)
+                    if (typeof s.send === 'function') {
+                         s.send(triggerMsg);
+                    }
+
+                    // 2. Fallback: Send 1 second of silence to simulate a completed user turn
+                    // This helps if the text trigger is ignored or not supported in this version
+                    const silence = new Float32Array(16000); 
+                    const pcmBlob = createPcmBlob(silence);
+                    // Send a few buffers to ensure connection liveliness
+                    s.sendRealtimeInput({ media: pcmBlob });
+                });
+            }, 100);
 
             // Process Input Audio
             const source = inputCtx.createMediaStreamSource(stream);
@@ -159,6 +183,11 @@ Rules for interaction:
              // Handle Audio Output
              const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
              if (base64Audio) {
+               // Ensure context is running when we receive audio
+               if (outputCtx.state === 'suspended') {
+                   await outputCtx.resume();
+               }
+
                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
                
                const audioBytes = base64ToBytes(base64Audio);
